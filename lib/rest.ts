@@ -8,9 +8,12 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   createRepo,
   deleteRepo,
+  findItem,
   findRepo,
   nowIso,
   viewerLogin,
+  type IssueRec,
+  type LabelRec,
   type RepoRec,
   type Store,
 } from './store.ts';
@@ -22,9 +25,11 @@ import {
   flattenTree,
   gitRepo,
   isAncestor,
+  mergeBase,
   readObject,
   refSha,
   setRef,
+  threeWayMergeTrees,
   walkCommits,
   writeCommit,
   writeObject,
@@ -678,6 +683,10 @@ async function handleRepoDeep(
     return false;
   }
 
+  if (head === 'labels') return handleLabels(store, req, res, url, repo, parts);
+  if (head === 'issues') return handleIssues(store, req, res, url, repo, parts);
+  if (head === 'pulls') return handlePulls(store, req, res, url, repo, parts);
+
   if (head === 'contents') {
     const path = parts.slice(1).map((part) => decodeURIComponent(part)).join('/');
     if (method === 'GET') {
@@ -690,6 +699,676 @@ async function handleRepoDeep(
     }
     if (method === 'DELETE') {
       await handleContentsDelete(store, req, res, repo, path);
+      return true;
+    }
+    return false;
+  }
+
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Labels, issues, comments and pull requests. Issues and pull requests share
+// one numbering sequence per repository (as on GitHub); a pull request is an
+// issue record with head/base refs and merge state.
+
+/** A label as a GitHub label object. */
+function labelJson(base: string, fullName: string, label: LabelRec): Record<string, unknown> {
+  return {
+    id: label.id,
+    node_id: Buffer.from(`Label:${label.id}`).toString('base64'),
+    url: `${base}/api/v3/repos/${fullName}/labels/${encodeURIComponent(label.name)}`,
+    name: label.name,
+    color: label.color,
+    default: false,
+    description: label.description,
+  };
+}
+
+/** An issue as a GitHub issue object. */
+function issueJson(store: Store, base: string, fullName: string, repo: RepoRec, item: IssueRec): Record<string, unknown> {
+  const json: Record<string, unknown> = {
+    id: item.id,
+    node_id: Buffer.from(`Issue:${item.id}`).toString('base64'),
+    url: `${base}/api/v3/repos/${fullName}/issues/${item.number}`,
+    repository_url: `${base}/api/v3/repos/${fullName}`,
+    labels_url: `${base}/api/v3/repos/${fullName}/issues/${item.number}/labels{/name}`,
+    comments_url: `${base}/api/v3/repos/${fullName}/issues/${item.number}/comments`,
+    events_url: `${base}/api/v3/repos/${fullName}/issues/${item.number}/events`,
+    html_url: `${base}/${fullName}/issues/${item.number}`,
+    number: item.number,
+    state: item.state,
+    title: item.title,
+    body: item.body,
+    user: userJson(store, base),
+    labels: item.labels
+      .map((name) => repo.labels.get(name))
+      .filter((label): label is LabelRec => label !== undefined)
+      .map((label) => labelJson(base, fullName, label)),
+    assignee: null,
+    assignees: [],
+    milestone: null,
+    locked: false,
+    active_lock_reason: null,
+    comments: item.comments.length,
+    closed_at: item.closedAt ?? null,
+    created_at: item.createdAt,
+    updated_at: item.updatedAt,
+    author_association: 'OWNER',
+  };
+  if (item.kind === 'pull') {
+    json.pull_request = {
+      url: `${base}/api/v3/repos/${fullName}/pulls/${item.number}`,
+      html_url: `${base}/${fullName}/pull/${item.number}`,
+      diff_url: `${base}/${fullName}/pull/${item.number}.diff`,
+      patch_url: `${base}/${fullName}/pull/${item.number}.patch`,
+    };
+  }
+  return json;
+}
+
+/** A comment as a GitHub issue-comment object. */
+function commentJson(store: Store, base: string, fullName: string, item: IssueRec, commentId: number): Record<string, unknown> {
+  const comment = item.comments.find((c) => c.id === commentId);
+  return {
+    id: commentId,
+    node_id: Buffer.from(`Comment:${commentId}`).toString('base64'),
+    url: `${base}/api/v3/repos/${fullName}/issues/comments/${commentId}`,
+    html_url: `${base}/${fullName}/issues/${item.number}#issuecomment-${commentId}`,
+    body: comment?.body ?? '',
+    user: userJson(store, base),
+    created_at: comment?.createdAt ?? nowIso(),
+    updated_at: comment?.updatedAt ?? nowIso(),
+    issue_url: `${base}/api/v3/repos/${fullName}/issues/${item.number}`,
+    author_association: 'OWNER',
+  };
+}
+
+/** Label names from a create/patch body: strings, or objects with a name. */
+function labelNamesOf(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const names: string[] = [];
+  for (const entry of value) {
+    if (typeof entry === 'string') names.push(entry);
+    else if (entry !== null && typeof entry === 'object' && typeof (entry as { name?: unknown }).name === 'string') {
+      names.push((entry as { name: string }).name);
+    }
+  }
+  return names;
+}
+
+/** Routes under /repos/{o}/{r}/labels. */
+async function handleLabels(
+  store: Store,
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  repo: RepoRec,
+  parts: string[],
+): Promise<boolean> {
+  const method = req.method ?? 'GET';
+  const base = baseUrl(req);
+  const fullName = `${viewerLogin(store)}/${repo.name}`;
+  if (parts.length === 1) {
+    if (method === 'GET') {
+      const all = [...repo.labels.values()].sort((a, b) => (a.name < b.name ? -1 : 1));
+      sendJson(res, 200, paginate(req, res, url, all).map((label) => labelJson(base, fullName, label)));
+      return true;
+    }
+    if (method === 'POST') {
+      const parsed = parseJsonBody(await readBody(req));
+      if ('malformed' in parsed) {
+        sendError(res, 400, 'Problems parsing JSON');
+        return true;
+      }
+      const name = stringField(parsed.value, 'name');
+      if (name === null || name === '') {
+        sendJson(res, 422, { message: 'Validation Failed', errors: [{ resource: 'Label', field: 'name', code: 'missing_field' }] });
+        return true;
+      }
+      if (repo.labels.has(name)) {
+        sendJson(res, 422, { message: 'Validation Failed', errors: [{ resource: 'Label', field: 'name', code: 'already_exists' }] });
+        return true;
+      }
+      const label: LabelRec = {
+        id: store.nextLabelId,
+        name,
+        color: (stringField(parsed.value, 'color') ?? 'ededed').replace(/^#/, ''),
+        description: stringField(parsed.value, 'description') ?? '',
+      };
+      store.nextLabelId += 1;
+      repo.labels.set(name, label);
+      sendJson(res, 201, labelJson(base, fullName, label));
+      return true;
+    }
+    return false;
+  }
+  if (parts.length === 2) {
+    const name = decodeURIComponent(parts[1] ?? '');
+    const label = repo.labels.get(name);
+    if (method === 'GET') {
+      if (label === undefined) sendError(res, 404, 'Not Found');
+      else sendJson(res, 200, labelJson(base, fullName, label));
+      return true;
+    }
+    if (method === 'DELETE') {
+      if (label === undefined) {
+        sendError(res, 404, 'Not Found');
+        return true;
+      }
+      repo.labels.delete(name);
+      sendEmpty(res, 204);
+      return true;
+    }
+    if (method === 'PATCH') {
+      if (label === undefined) {
+        sendError(res, 404, 'Not Found');
+        return true;
+      }
+      const parsed = parseJsonBody(await readBody(req));
+      if ('malformed' in parsed) {
+        sendError(res, 400, 'Problems parsing JSON');
+        return true;
+      }
+      const newName = stringField(parsed.value, 'new_name') ?? stringField(parsed.value, 'name');
+      const color = stringField(parsed.value, 'color');
+      if (color !== null) label.color = color.replace(/^#/, '');
+      const description = stringField(parsed.value, 'description');
+      if (description !== null) label.description = description;
+      if (newName !== null && newName !== '' && newName !== name) {
+        repo.labels.delete(name);
+        label.name = newName;
+        repo.labels.set(newName, label);
+        for (const item of repo.items) item.labels = item.labels.map((l) => (l === name ? newName : l));
+      }
+      sendJson(res, 200, labelJson(base, fullName, label));
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+/** Routes under /repos/{o}/{r}/issues (comments included). */
+async function handleIssues(
+  store: Store,
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  repo: RepoRec,
+  parts: string[],
+): Promise<boolean> {
+  const method = req.method ?? 'GET';
+  const base = baseUrl(req);
+  const fullName = `${viewerLogin(store)}/${repo.name}`;
+
+  if (parts.length === 1) {
+    if (method === 'GET') {
+      const state = url.searchParams.get('state') ?? 'open';
+      let items = repo.items.filter((item) => item.kind === 'issue');
+      if (state === 'open') items = items.filter((item) => item.state === 'open');
+      else if (state === 'closed') items = items.filter((item) => item.state === 'closed');
+      const direction = url.searchParams.get('direction') ?? 'desc';
+      items = [...items].sort((a, b) => (direction === 'asc' ? a.createdSeq - b.createdSeq : b.createdSeq - a.createdSeq));
+      const page = paginate(req, res, url, items);
+      sendJson(res, 200, page.map((item) => issueJson(store, base, fullName, repo, item)));
+      return true;
+    }
+    if (method === 'POST') {
+      const parsed = parseJsonBody(await readBody(req));
+      if ('malformed' in parsed) {
+        sendError(res, 400, 'Problems parsing JSON');
+        return true;
+      }
+      const title = stringField(parsed.value, 'title');
+      if (title === null || title === '') {
+        sendJson(res, 422, { message: 'Validation Failed', errors: [{ resource: 'Issue', field: 'title', code: 'missing_field' }] });
+        return true;
+      }
+      const labels = labelNamesOf(parsed.value.labels);
+      for (const name of labels) {
+        if (!repo.labels.has(name)) {
+          sendJson(res, 422, { message: 'Validation Failed', errors: [{ resource: 'Issue', field: 'labels', code: 'invalid', message: `label '${name}' does not exist` }] });
+          return true;
+        }
+      }
+      const at = nowIso();
+      const item: IssueRec = {
+        id: store.nextIssueId,
+        number: repo.nextNumber,
+        kind: 'issue',
+        title,
+        body: stringField(parsed.value, 'body') ?? '',
+        state: 'open',
+        labels,
+        comments: [],
+        createdSeq: store.seq,
+        createdAt: at,
+        updatedAt: at,
+        closedAt: null,
+      };
+      store.nextIssueId += 1;
+      store.seq += 1;
+      repo.nextNumber += 1;
+      repo.items.push(item);
+      sendJson(res, 201, issueJson(store, base, fullName, repo, item));
+      return true;
+    }
+    return false;
+  }
+
+  const number = Number(parts[1]);
+  const item = Number.isInteger(number) ? findItem(repo, number) : null;
+
+  if (parts.length === 2) {
+    if (item === null) {
+      sendError(res, 404, 'Not Found');
+      return true;
+    }
+    if (method === 'GET') {
+      sendJson(res, 200, issueJson(store, base, fullName, repo, item));
+      return true;
+    }
+    if (method === 'PATCH') {
+      const parsed = parseJsonBody(await readBody(req));
+      if ('malformed' in parsed) {
+        sendError(res, 400, 'Problems parsing JSON');
+        return true;
+      }
+      const title = stringField(parsed.value, 'title');
+      if (title !== null) item.title = title;
+      const body = stringField(parsed.value, 'body');
+      if (body !== null) item.body = body;
+      if (Array.isArray(parsed.value.labels)) {
+        const labels = labelNamesOf(parsed.value.labels);
+        for (const name of labels) {
+          if (!repo.labels.has(name)) {
+            sendJson(res, 422, { message: 'Validation Failed', errors: [{ resource: 'Issue', field: 'labels', code: 'invalid' }] });
+            return true;
+          }
+        }
+        item.labels = labels;
+      }
+      const state = stringField(parsed.value, 'state');
+      if (state === 'closed' || state === 'open') {
+        item.state = state;
+        item.closedAt = state === 'closed' ? nowIso() : null;
+      }
+      item.updatedAt = nowIso();
+      sendJson(res, 200, issueJson(store, base, fullName, repo, item));
+      return true;
+    }
+    return false;
+  }
+
+  if (parts.length === 3 && parts[2] === 'comments') {
+    if (item === null) {
+      sendError(res, 404, 'Not Found');
+      return true;
+    }
+    if (method === 'GET') {
+      const sorted = [...item.comments].sort((a, b) => a.createdSeq - b.createdSeq);
+      const page = paginate(req, res, url, sorted);
+      sendJson(res, 200, page.map((comment) => commentJson(store, base, fullName, item, comment.id)));
+      return true;
+    }
+    if (method === 'POST') {
+      const parsed = parseJsonBody(await readBody(req));
+      if ('malformed' in parsed) {
+        sendError(res, 400, 'Problems parsing JSON');
+        return true;
+      }
+      const body = stringField(parsed.value, 'body');
+      if (body === null) {
+        sendJson(res, 422, { message: 'Validation Failed', errors: [{ resource: 'Comment', field: 'body', code: 'missing_field' }] });
+        return true;
+      }
+      const at = nowIso();
+      const comment = { id: store.nextCommentId, body, createdSeq: store.seq, createdAt: at, updatedAt: at };
+      store.nextCommentId += 1;
+      store.seq += 1;
+      item.comments.push(comment);
+      item.updatedAt = at;
+      sendJson(res, 201, commentJson(store, base, fullName, item, comment.id));
+      return true;
+    }
+    return false;
+  }
+
+  if (parts.length === 3 && parts[2] === 'labels') {
+    if (item === null) {
+      sendError(res, 404, 'Not Found');
+      return true;
+    }
+    if (method === 'POST' || method === 'PUT') {
+      const parsed = parseJsonBody(await readBody(req));
+      if ('malformed' in parsed) {
+        sendError(res, 400, 'Problems parsing JSON');
+        return true;
+      }
+      const labels = labelNamesOf(parsed.value.labels ?? parsed.value);
+      for (const name of labels) {
+        if (!repo.labels.has(name)) {
+          sendJson(res, 422, { message: 'Validation Failed', errors: [{ resource: 'Issue', field: 'labels', code: 'invalid' }] });
+          return true;
+        }
+      }
+      item.labels = method === 'PUT' ? labels : [...new Set([...item.labels, ...labels])];
+      item.updatedAt = nowIso();
+      sendJson(res, 200, item.labels.map((name) => labelJson(base, fullName, repo.labels.get(name) as LabelRec)));
+      return true;
+    }
+    if (method === 'DELETE') {
+      item.labels = [];
+      sendJson(res, 200, []);
+      return true;
+    }
+    if (method === 'GET') {
+      sendJson(res, 200, item.labels.map((name) => labelJson(base, fullName, repo.labels.get(name) as LabelRec)));
+      return true;
+    }
+    return false;
+  }
+  if (parts.length === 4 && parts[2] === 'labels' && method === 'DELETE') {
+    if (item === null) {
+      sendError(res, 404, 'Not Found');
+      return true;
+    }
+    const name = decodeURIComponent(parts[3] ?? '');
+    item.labels = item.labels.filter((l) => l !== name);
+    sendJson(res, 200, item.labels.map((l) => labelJson(base, fullName, repo.labels.get(l) as LabelRec)));
+    return true;
+  }
+
+  return false;
+}
+
+/** A pull request as a GitHub pull-request object. */
+function pullJson(store: Store, base: string, fullName: string, repo: RepoRec, g: GitRepo, item: IssueRec): Record<string, unknown> {
+  const headSha = item.headRef !== undefined ? (branchHead(g, item.headRef) ?? item.headSha ?? '') : (item.headSha ?? '');
+  const baseSha = item.baseRef !== undefined ? (branchHead(g, item.baseRef) ?? item.baseSha ?? '') : (item.baseSha ?? '');
+  const refJsonFor = (ref: string | undefined, sha: string): Record<string, unknown> => ({
+    label: `${viewerLogin(store)}:${ref ?? ''}`,
+    ref: ref ?? '',
+    sha,
+    user: userJson(store, base),
+    repo: repoJson(store, repo, base),
+  });
+  return {
+    ...issueJson(store, base, fullName, repo, item),
+    url: `${base}/api/v3/repos/${fullName}/pulls/${item.number}`,
+    html_url: `${base}/${fullName}/pull/${item.number}`,
+    diff_url: `${base}/${fullName}/pull/${item.number}.diff`,
+    patch_url: `${base}/${fullName}/pull/${item.number}.patch`,
+    merged_at: item.mergedAt ?? null,
+    merge_commit_sha: item.mergeSha ?? null,
+    merged: item.merged ?? false,
+    head: refJsonFor(item.headRef, headSha),
+    base: refJsonFor(item.baseRef, baseSha),
+    _links: {
+      self: { href: `${base}/api/v3/repos/${fullName}/pulls/${item.number}` },
+      html: { href: `${base}/${fullName}/pull/${item.number}` },
+      issue: { href: `${base}/api/v3/repos/${fullName}/issues/${item.number}` },
+      comments: { href: `${base}/api/v3/repos/${fullName}/issues/${item.number}/comments` },
+      commits: { href: `${base}/api/v3/repos/${fullName}/pulls/${item.number}/commits` },
+    },
+    author_association: 'OWNER',
+    draft: false,
+    additions: 0,
+    deletions: 0,
+    changed_files: 0,
+    commits: 0,
+    comments: item.comments.length,
+    review_comments: 0,
+    maintainer_can_modify: true,
+  };
+}
+
+/** Line counts of a text diff: an LCS over lines, plenty for these file sizes. */
+function lineDiffCounts(before: string, after: string): { additions: number; deletions: number } {
+  if (before === after) return { additions: 0, deletions: 0 };
+  const a = before === '' ? [] : before.split('\n');
+  const b = after === '' ? [] : after.split('\n');
+  // Classic LCS dynamic program over lines.
+  const dp: number[][] = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
+  for (let i = a.length - 1; i >= 0; i -= 1) {
+    for (let j = b.length - 1; j >= 0; j -= 1) {
+      dp[i]![j] = a[i] === b[j] ? (dp[i + 1]![j + 1] ?? 0) + 1 : Math.max(dp[i + 1]![j] ?? 0, dp[i]![j + 1] ?? 0);
+    }
+  }
+  const common = dp[0]![0] ?? 0;
+  return { additions: b.length - common, deletions: a.length - common };
+}
+
+/** The files a pull request changes: merge-base tree against head tree. */
+function pullFiles(g: GitRepo, item: IssueRec): { path: string; status: string; baseSha: string | null; headSha: string | null }[] {
+  const headSha = item.headRef !== undefined ? branchHead(g, item.headRef) : null;
+  const baseSha = item.baseRef !== undefined ? branchHead(g, item.baseRef) : null;
+  if (headSha === null || baseSha === null) return [];
+  const ancestor = mergeBase(g, baseSha, headSha) ?? baseSha;
+  const baseTree = commitInfo(g, ancestor)?.tree ?? null;
+  const headTree = commitInfo(g, headSha)?.tree ?? null;
+  const baseFiles = baseTree === null ? new Map<string, string>() : new Map([...flattenTree(g, baseTree)].map(([p, e]) => [p, e.sha]));
+  const headFiles = headTree === null ? new Map<string, string>() : new Map([...flattenTree(g, headTree)].map(([p, e]) => [p, e.sha]));
+  const out: { path: string; status: string; baseSha: string | null; headSha: string | null }[] = [];
+  for (const path of new Set([...baseFiles.keys(), ...headFiles.keys()])) {
+    const b = baseFiles.get(path);
+    const h = headFiles.get(path);
+    if (b === h) continue;
+    out.push({ path, status: b === undefined ? 'added' : h === undefined ? 'removed' : 'modified', baseSha: b ?? null, headSha: h ?? null });
+  }
+  return out.sort((x, y) => (x.path < y.path ? -1 : 1));
+}
+
+/** Routes under /repos/{o}/{r}/pulls. */
+async function handlePulls(
+  store: Store,
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  repo: RepoRec,
+  parts: string[],
+): Promise<boolean> {
+  const method = req.method ?? 'GET';
+  const base = baseUrl(req);
+  const fullName = `${viewerLogin(store)}/${repo.name}`;
+  const g = gitRepo(repo.id);
+
+  if (parts.length === 1) {
+    if (method === 'GET') {
+      const state = url.searchParams.get('state') ?? 'open';
+      let items = repo.items.filter((item) => item.kind === 'pull');
+      if (state === 'open') items = items.filter((item) => item.state === 'open');
+      else if (state === 'closed') items = items.filter((item) => item.state === 'closed');
+      items = [...items].sort((a, b) => b.createdSeq - a.createdSeq);
+      const page = paginate(req, res, url, items);
+      sendJson(res, 200, page.map((item) => pullJson(store, base, fullName, repo, g, item)));
+      return true;
+    }
+    if (method === 'POST') {
+      const parsed = parseJsonBody(await readBody(req));
+      if ('malformed' in parsed) {
+        sendError(res, 400, 'Problems parsing JSON');
+        return true;
+      }
+      const title = stringField(parsed.value, 'title');
+      const headRef = stringField(parsed.value, 'head');
+      const baseRef = stringField(parsed.value, 'base') ?? repo.defaultBranch;
+      if (title === null || headRef === null) {
+        sendJson(res, 422, { message: 'Validation Failed', errors: [{ resource: 'PullRequest', field: title === null ? 'title' : 'head', code: 'missing_field' }] });
+        return true;
+      }
+      const headSha = branchHead(g, headRef.replace(/^[^:]+:/, ''));
+      const baseSha = branchHead(g, baseRef);
+      if (headSha === null || baseSha === null) {
+        sendJson(res, 422, { message: 'Validation Failed', errors: [{ resource: 'PullRequest', field: 'head', code: 'invalid', message: 'head branch does not exist' }] });
+        return true;
+      }
+      const at = nowIso();
+      const item: IssueRec = {
+        id: store.nextIssueId,
+        number: repo.nextNumber,
+        kind: 'pull',
+        title,
+        body: stringField(parsed.value, 'body') ?? '',
+        state: 'open',
+        labels: [],
+        comments: [],
+        createdSeq: store.seq,
+        createdAt: at,
+        updatedAt: at,
+        closedAt: null,
+        headRef: headRef.replace(/^[^:]+:/, ''),
+        headSha,
+        baseRef,
+        baseSha,
+        merged: false,
+        mergedAt: null,
+      };
+      store.nextIssueId += 1;
+      store.seq += 1;
+      repo.nextNumber += 1;
+      repo.items.push(item);
+      sendJson(res, 201, pullJson(store, base, fullName, repo, g, item));
+      return true;
+    }
+    return false;
+  }
+
+  const number = Number(parts[1]);
+  const item = Number.isInteger(number) ? findItem(repo, number) : null;
+  if (item === null || item.kind !== 'pull') {
+    sendError(res, 404, 'Not Found');
+    return true;
+  }
+
+  if (parts.length === 2 && method === 'GET') {
+    sendJson(res, 200, pullJson(store, base, fullName, repo, g, item));
+    return true;
+  }
+  if (parts.length === 2 && method === 'PATCH') {
+    const parsed = parseJsonBody(await readBody(req));
+    if ('malformed' in parsed) {
+      sendError(res, 400, 'Problems parsing JSON');
+      return true;
+    }
+    const title = stringField(parsed.value, 'title');
+    if (title !== null) item.title = title;
+    const body = stringField(parsed.value, 'body');
+    if (body !== null) item.body = body;
+    const state = stringField(parsed.value, 'state');
+    if (state === 'closed' || state === 'open') {
+      item.state = state;
+      item.closedAt = state === 'closed' ? nowIso() : null;
+    }
+    item.updatedAt = nowIso();
+    sendJson(res, 200, pullJson(store, base, fullName, repo, g, item));
+    return true;
+  }
+
+  if (parts.length === 3 && parts[2] === 'files' && method === 'GET') {
+    const files = pullFiles(g, item).map((file) => {
+      const before = file.baseSha === null ? '' : (readObject(g, file.baseSha)?.data.toString('utf8') ?? '');
+      const after = file.headSha === null ? '' : (readObject(g, file.headSha)?.data.toString('utf8') ?? '');
+      const counts = lineDiffCounts(before, after);
+      return {
+        sha: file.headSha ?? file.baseSha ?? '',
+        filename: file.path,
+        status: file.status,
+        additions: counts.additions,
+        deletions: counts.deletions,
+        changes: counts.additions + counts.deletions,
+        blob_url: `${base}/api/v3/repos/${fullName}/git/blobs/${file.headSha ?? ''}`,
+        raw_url: `${base}/${fullName}/raw/${item.headRef ?? ''}/${file.path}`,
+        contents_url: `${base}/api/v3/repos/${fullName}/contents/${file.path}?ref=${item.headRef ?? ''}`,
+      };
+    });
+    sendJson(res, 200, paginate(req, res, url, files));
+    return true;
+  }
+
+  if (parts.length === 3 && parts[2] === 'commits' && method === 'GET') {
+    const headSha = item.headRef !== undefined ? branchHead(g, item.headRef) : null;
+    const baseSha = item.baseRef !== undefined ? branchHead(g, item.baseRef) : null;
+    if (headSha === null || baseSha === null) {
+      sendJson(res, 200, []);
+      return true;
+    }
+    const baseAncestors = new Set(walkCommits(g, baseSha, 100000));
+    const shas = walkCommits(g, headSha).filter((sha) => !baseAncestors.has(sha));
+    const page = paginate(req, res, url, shas);
+    sendJson(res, 200, page.map((sha) => commitJson(store, g, sha, base, fullName)));
+    return true;
+  }
+
+  if (parts.length === 3 && parts[2] === 'merge') {
+    if (method === 'GET') {
+      sendJson(res, 200, { merged: item.merged ?? false, message: item.merged ? 'Pull Request is merged' : 'Not merged' });
+      return true;
+    }
+    if (method === 'PUT') {
+      const parsed = parseJsonBody(await readBody(req));
+      if ('malformed' in parsed) {
+        sendError(res, 400, 'Problems parsing JSON');
+        return true;
+      }
+      if (item.state === 'closed' && item.merged) {
+        sendError(res, 405, 'Pull Request is already merged');
+        return true;
+      }
+      const baseRef = item.baseRef ?? repo.defaultBranch;
+      const headRef = item.headRef ?? '';
+      const baseTip = branchHead(g, baseRef);
+      const headTip = branchHead(g, headRef);
+      if (baseTip === null || headTip === null) {
+        sendError(res, 405, 'Pull Request is not mergeable');
+        return true;
+      }
+      const ancestor = mergeBase(g, baseTip, headTip);
+      const ancestorTree = ancestor === null ? null : (commitInfo(g, ancestor)?.tree ?? null);
+      const baseTree = commitInfo(g, baseTip)?.tree ?? '';
+      const headTree = commitInfo(g, headTip)?.tree ?? '';
+      const mergeMethod = stringField(parsed.value, 'merge_method') ?? 'merge';
+      let newSha: string;
+      if (mergeMethod === 'squash') {
+        const merged = threeWayMergeTrees(g, ancestorTree, baseTree, headTree);
+        if (merged.tree === undefined) {
+          sendError(res, 405, 'Pull Request is not mergeable');
+          return true;
+        }
+        const login = viewerLogin(store);
+        const message = stringField(parsed.value, 'commit_message') ?? `${item.title} (#${item.number})`;
+        newSha = writeCommit(g, { tree: merged.tree, parents: [baseTip], authorName: login, authorEmail: `${login}@example.invalid`, message });
+      } else if (isAncestor(g, headTip, baseTip)) {
+        newSha = baseTip; // Already up to date: nothing to merge.
+      } else if (isAncestor(g, baseTip, headTip)) {
+        newSha = headTip; // Fast-forward.
+        // A plain merge still records a merge commit on GitHub unless told
+        // otherwise; the fast-forward sha keeps content checks honest.
+      } else {
+        const merged = threeWayMergeTrees(g, ancestorTree, baseTree, headTree);
+        if (merged.tree === undefined) {
+          sendError(res, 405, 'Pull Request is not mergeable');
+          return true;
+        }
+        const login = viewerLogin(store);
+        newSha = writeCommit(g, {
+          tree: merged.tree,
+          parents: [baseTip, headTip],
+          authorName: login,
+          authorEmail: `${login}@example.invalid`,
+          message: stringField(parsed.value, 'commit_message') ?? `Merge pull request #${item.number}`,
+        });
+      }
+      setRef(g, `refs/heads/${baseRef}`, newSha);
+      item.merged = true;
+      item.mergeSha = newSha;
+      item.mergedAt = nowIso();
+      item.state = 'closed';
+      item.closedAt = item.mergedAt;
+      item.updatedAt = item.mergedAt;
+      repo.updatedAt = item.mergedAt;
+      sendJson(res, 200, { sha: newSha, merged: true, message: 'Pull Request successfully merged' });
       return true;
     }
     return false;

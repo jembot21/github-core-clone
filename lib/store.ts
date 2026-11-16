@@ -42,6 +42,10 @@ export interface IssueRec {
   baseSha?: string;
   merged?: boolean;
   mergeSha?: string;
+  /** When the issue or pull request was closed, if it is. */
+  closedAt?: string | null;
+  /** When the pull request was merged, if it was. */
+  mergedAt?: string | null;
 }
 
 export interface RepoRec {

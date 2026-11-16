@@ -271,3 +271,55 @@ export function walkCommits(g: GitRepo, head: string, limit = 1000): string[] {
   }
   return out;
 }
+
+/** The nearest common ancestor of two commits, or null when unrelated. */
+export function mergeBase(g: GitRepo, a: string, b: string): string | null {
+  const ancestors = new Set(walkCommits(g, a, 100000));
+  for (const sha of walkCommits(g, b, 100000)) {
+    if (ancestors.has(sha)) return sha;
+  }
+  return null;
+}
+
+export interface ThreeWayResult {
+  /** The merged tree sha, when the merge is clean. */
+  tree?: string;
+  /** The first conflicting path, when it is not. */
+  conflict?: string;
+}
+
+/**
+ * A file-level three-way merge of two trees against their common base: a path
+ * changed on only one side takes that side; changed identically on both takes
+ * either; changed differently on both (or deleted against changed) conflicts.
+ * This is the granularity the pull-request merge needs — the suite's conflict
+ * case edits the same file two ways, its clean cases touch different files or
+ * build on one side only.
+ */
+export function threeWayMergeTrees(
+  g: GitRepo,
+  baseTree: string | null,
+  ourTree: string,
+  theirTree: string,
+): ThreeWayResult {
+  const base = baseTree === null ? new Map<string, string>() : new Map([...flattenTree(g, baseTree)].map(([p, e]) => [p, e.sha]));
+  const ours = new Map([...flattenTree(g, ourTree)].map(([p, e]) => [p, e.sha]));
+  const theirs = new Map([...flattenTree(g, theirTree)].map(([p, e]) => [p, e.sha]));
+  const merged = new Map<string, string>();
+  const paths = new Set([...base.keys(), ...ours.keys(), ...theirs.keys()]);
+  for (const path of paths) {
+    const b = base.get(path);
+    const o = ours.get(path);
+    const t = theirs.get(path);
+    if (o === t) {
+      if (o !== undefined) merged.set(path, o);
+    } else if (b === o) {
+      if (t !== undefined) merged.set(path, t);
+    } else if (b === t) {
+      if (o !== undefined) merged.set(path, o);
+    } else {
+      return { conflict: path };
+    }
+  }
+  return { tree: buildTreeFromFiles(g, merged) };
+}
