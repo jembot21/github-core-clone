@@ -1141,7 +1141,7 @@ function lineDiffCounts(before: string, after: string): { additions: number; del
 }
 
 /** The files a pull request changes: merge-base tree against head tree. */
-function pullFiles(g: GitRepo, item: IssueRec): { path: string; status: string; baseSha: string | null; headSha: string | null }[] {
+export function pullFiles(g: GitRepo, item: IssueRec): { path: string; status: string; baseSha: string | null; headSha: string | null }[] {
   const headSha = item.headRef !== undefined ? branchHead(g, item.headRef) : null;
   const baseSha = item.baseRef !== undefined ? branchHead(g, item.baseRef) : null;
   if (headSha === null || baseSha === null) return [];

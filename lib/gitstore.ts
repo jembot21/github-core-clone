@@ -226,6 +226,11 @@ export function refSha(g: GitRepo, ref: string): string | null {
   return g.refs.get(ref) ?? null;
 }
 
+/** The sha a branch names (its refs/heads/<branch> ref), or null. */
+export function branchHead(g: GitRepo, branch: string): string | null {
+  return refSha(g, `refs/heads/${branch}`);
+}
+
 /** Move (or create) a ref. */
 export function setRef(g: GitRepo, ref: string, sha: string): void {
   g.refs.set(ref, sha);
