@@ -8,6 +8,7 @@ import { createStore } from './lib/store.ts';
 import { handleRest } from './lib/rest.ts';
 import { handleGit } from './lib/githttp.ts';
 import { handleGraphql } from './lib/graphql.ts';
+import { handleMcp } from './lib/mcp.ts';
 import { sendError } from './lib/http.ts';
 
 /** The path of a request URL, or '/' when it does not parse (never a throw). */
@@ -62,6 +63,7 @@ export function createApp(): Server {
 
       if (await handleRest(store, req, res, url)) return;
       if (await handleGraphql(store, req, res, url)) return;
+      if (await handleMcp(store, req, res, url)) return;
       if (await handleGit(store, req, res, url)) return;
 
       // Everything else, every method: GitHub's 404 body, as JSON, never HTML.
