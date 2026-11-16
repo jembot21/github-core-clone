@@ -137,22 +137,28 @@ export function buildPack(objects: Iterable<{ sha: string; type: ObjectType; dat
 }
 
 /** Inflate one zlib stream starting at `at`; returns the data and bytes used. */
-function inflateOne(buf: Buffer, at: number): { data: Buffer; used: number } {
+function inflateOne(buf: Buffer, at: number, expectedSize: number): { data: Buffer; used: number } {
   // inflateSync tolerates trailing bytes, so the smallest prefix that inflates
-  // is exactly the stream: binary-search for it.
-  let lo = at + 1;
-  let hi = buf.length;
-  let best = -1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      inflateSync(buf.subarray(at, mid));
-      best = mid;
-      hi = mid - 1;
-    } catch {
-      lo = mid + 1;
+  // is exactly the stream: binary-search for it. The declared object size
+  // bounds the search first (a deflated object is rarely larger than its raw
+  // size plus slack); if that window holds no stream end, search the whole tail.
+  const search = (hi: number): number => {
+    let lo = at + 1;
+    let best = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      try {
+        inflateSync(buf.subarray(at, mid));
+        best = mid;
+        hi = mid - 1;
+      } catch {
+        lo = mid + 1;
+      }
     }
-  }
+    return best;
+  };
+  let best = search(Math.min(buf.length, at + Math.ceil(expectedSize * 1.05) + 512));
+  if (best === -1) best = search(buf.length);
   if (best === -1) throw new Error('corrupt zlib stream in pack');
   return { data: inflateSync(buf.subarray(at, best)), used: best - at };
 }
@@ -260,7 +266,7 @@ export function readPack(
       entry.baseSha = pack.toString('hex', at, at + 20);
       at += 20;
     }
-    const inflated = inflateOne(pack.subarray(0, bodyEnd + 20), at);
+    const inflated = inflateOne(pack.subarray(0, bodyEnd + 20), at, size);
     if (inflated.data.length !== size) throw new Error('pack object size mismatch');
     entry.data = inflated.data;
     at += inflated.used;
