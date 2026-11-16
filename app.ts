@@ -6,6 +6,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createStore } from './lib/store.ts';
 import { handleRest } from './lib/rest.ts';
+import { handleGit } from './lib/githttp.ts';
 import { sendError } from './lib/http.ts';
 
 /** The path of a request URL, or '/' when it does not parse (never a throw). */
@@ -59,6 +60,7 @@ export function createApp(): Server {
       }
 
       if (await handleRest(store, req, res, url)) return;
+      if (await handleGit(store, req, res, url)) return;
 
       // Everything else, every method: GitHub's 404 body, as JSON, never HTML.
       sendError(res, 404, 'Not Found');
