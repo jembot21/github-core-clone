@@ -23,12 +23,27 @@ async function reportPort(envUrl: string, port: number): Promise<void> {
   throw new Error('registration with the environment failed');
 }
 
-/** Poll the environment's done endpoint until it answers 200. */
+/**
+ * Poll the environment's done endpoint until it reports completion.
+ * The endpoint always answers HTTP 200; its JSON body carries
+ * { done: false } while the trial runs and { done: true } at the end,
+ * so only the body — never the status alone — ends the wait.
+ */
 async function awaitDone(envUrl: string): Promise<void> {
   for (;;) {
     try {
       const answer = await fetch(`${envUrl}/done`);
-      if (answer.ok) return;
+      if (answer.ok) {
+        // The endpoint answers 200 either way; the JSON body decides.
+        const body: unknown = await answer.json().catch(() => undefined);
+        if (
+          body !== null &&
+          typeof body === 'object' &&
+          (body as { done?: unknown }).done === true
+        ) {
+          return;
+        }
+      }
     } catch {
       // A failed poll says nothing about the trial; keep waiting.
     }
